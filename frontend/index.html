@@ -59,10 +59,20 @@ createApp({
     const user=ref(localStorage.getItem('lagboard_user')||'');
     const username=ref('admin'), password=ref('123456'), err=ref(''), tab=ref(0), actionErr=ref('');
     const sources=ref([]), arrivals=ref([]), catchups=ref([]);
+    const policies=ref([]), watermarks=ref([]), history=ref([]), cards=ref([]), traces=ref({audit:[],deviations:[],contention:[]});
     const form=ref({source:'订单源', source_clock:'2026-11-16T10:00:00', ingest_clock:'2026-11-16T10:40:00'});
-    const nav=['到达登记','滞后分级','补齐恢复'];
+    const tierForm=ref({source:'支付源', sla_minutes:60, path:'甲'});
+    const tierErr=ref(''), tierMsg=ref('');
+    const nav=['到达登记','滞后分级','补齐恢复','时限台策略','水位页','历史目录'];
     const frozen=computed(()=>sources.value.filter(s=>s.output_mode==='冻结').length);
     const degraded=computed(()=>sources.value.filter(s=>s.output_mode==='降级只读').length);
+    const todayCard=computed(()=>{
+      const d=new Date(); const day=`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+      return cards.value.find(c=>c.source===tierForm.value.source && c.day===day) || null;
+    });
+    const policiesOfSource=computed(()=>policies.value.filter(p=>p.source===tierForm.value.source));
+    const watermarksOfSource=computed(()=>watermarks.value.filter(w=>w.name===tierForm.value.source));
+    const historyOfSource=computed(()=>history.value.filter(x=>x.source===tierForm.value.source));
     function modeClass(m){return m==='冻结'?'bad':(m==='降级只读'?'warn':'ok');}
     function auth(){return {Authorization:'Bearer '+token.value,'Content-Type':'application/json'};}
     async function login(){
@@ -88,6 +98,16 @@ createApp({
       arrivals.value=Array.isArray(a.items)?a.items:[];
       const c=await loadJson('/api/catchups'); if(c===null) return;
       catchups.value=Array.isArray(c.items)?c.items:[];
+      const p=await loadJson('/api/sla-policies'); if(p===null) return;
+      policies.value=Array.isArray(p.items)?p.items:[];
+      const w=await loadJson('/api/watermarks'); if(w===null) return;
+      watermarks.value=Array.isArray(w.items)?w.items:[];
+      const h=await loadJson('/api/arrival-history'); if(h===null) return;
+      history.value=Array.isArray(h.items)?h.items:[];
+      const k=await loadJson('/api/readjudication-cards'); if(k===null) return;
+      cards.value=Array.isArray(k.items)?k.items:[];
+      const t=await loadJson('/api/readjudication-traces'); if(t===null) return;
+      traces.value={audit:t.audit||[],deviations:t.deviations||[],contention:t.contention||[]};
       if(sources.value.length && !form.value.source) form.value.source=sources.value[0].name;
     }
     async function recordArrival(){
@@ -97,8 +117,26 @@ createApp({
       await refresh();
     }
     async function doCatchup(name){await fetch('/api/catchup/'+encodeURIComponent(name),{method:'POST',headers:auth()});await refresh();}
+    async function changeTier(){
+      tierErr.value=''; tierMsg.value='';
+      const body={source:tierForm.value.source, sla_minutes:Number(tierForm.value.sla_minutes), path:tierForm.value.path};
+      const r=await fetch('/api/readjudications',{method:'POST',headers:auth(),body:JSON.stringify(body)});
+      const j=await r.json().catch(()=>({}));
+      if(!r.ok){ tierErr.value=j.detail||'重裁失败'; await refresh(); return; }
+      tierMsg.value=`裁决卡 #${j.card_id} · ${j.path}路径 · 已落地，五处按新档`;
+      await refresh();
+    }
+    async function executeCard(id,path){
+      tierErr.value=''; tierMsg.value='';
+      const r=await fetch(`/api/readjudications/${id}/execute`,{method:'POST',headers:auth(),body:JSON.stringify({path})});
+      const j=await r.json().catch(()=>({}));
+      if(!r.ok){ tierErr.value=j.detail||'执行失败'; await refresh(); return; }
+      tierMsg.value=`裁决卡 #${j.card_id} 已按${j.path}路径执行`;
+      await refresh();
+    }
     onMounted(()=>{if(token.value)refresh();});
-    return {token,user,username,password,err,tab,nav,sources,arrivals,catchups,form,actionErr,frozen,degraded,modeClass,login,logout,recordArrival,doCatchup};
+    return {token,user,username,password,err,tab,nav,sources,arrivals,catchups,form,actionErr,frozen,degraded,modeClass,login,logout,recordArrival,doCatchup,
+            policies,watermarks,history,cards,traces,tierForm,tierErr,tierMsg,todayCard,policiesOfSource,watermarksOfSource,historyOfSource,changeTier,executeCard};
   },
   template:`
   <div v-if="!token" class="login">
@@ -156,6 +194,49 @@ createApp({
         <h3>补齐记录</h3>
         <table><thead><tr><th>源</th><th>状态</th><th>恢复为</th><th>时间</th></tr></thead>
         <tbody><tr v-for="x in catchups" :key="x.id"><td>{{x.source}}</td><td>{{x.status}}</td><td>{{x.restored_mode}}</td><td>{{x.created_at}}</td></tr></tbody></table>
+      </div>
+      <div class="card" v-show="tab===3">
+        <h3 style="margin-bottom:8px">时限台策略 · 改时限档须走重裁</h3>
+        <p style="color:#64748b;font-size:13px;margin:0 0 10px">
+          改档只能由配置员/管理员在本页发起，甲（同笔事务整体回滚）或乙（先归档快照再强制复检）择一，不得混用。裁决卡写入即冻结，当天不可更换。
+        </p>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px">
+          <div><label>源</label><select v-model="tierForm.source"><option v-for="s in sources" :value="s.name">{{s.name}}</option></select></div>
+          <div><label>新时限档（分钟）</label><input type="number" v-model="tierForm.sla_minutes"/></div>
+          <div><label>重裁路径</label><select v-model="tierForm.path"><option value="甲">甲 · 同笔事务重算</option><option value="乙">乙 · 归档快照后复检</option></select></div>
+        </div>
+        <button class="primary" :disabled="!!todayCard" @click="changeTier">写入裁决卡并重裁</button>
+        <div class="err">{{tierErr}}</div>
+        <div style="color:var(--ok);font-size:13px;min-height:18px">{{tierMsg}}</div>
+        <div class="card" v-if="todayCard" style="border-color:var(--warn);margin-top:10px">
+          <b>今日裁决卡已冻结：#{{todayCard.id}}</b>
+          <div style="font-size:13px;color:#64748b;margin-top:6px">
+            {{todayCard.source}} · {{todayCard.old_sla}}→{{todayCard.new_sla}} 分 · {{todayCard.path}}路径 · {{todayCard.state}} · 当天不得更换
+          </div>
+          <button class="ghost" style="margin-top:8px" v-if="todayCard.state!=='已执行'" @click="executeCard(todayCard.id,todayCard.path)">按原卡原路径继续执行</button>
+        </div>
+        <h3 style="margin:16px 0 6px">策略附页（本仓改档流水）</h3>
+        <table><thead><tr><th>源</th><th>旧档</th><th>新档</th><th>路径</th><th>档版本</th><th>改档人</th><th>时间</th></tr></thead>
+          <tbody><tr v-for="p in policiesOfSource" :key="p.id"><td>{{p.source}}</td><td>{{p.old_sla}}</td><td>{{p.new_sla}}</td><td>{{p.path}}</td><td>v{{p.tier_version}}</td><td>{{p.changed_by}}</td><td>{{p.created_at}}</td></tr></tbody></table>
+        <h3 style="margin:16px 0 6px">重裁痕（偏卡驳回 / 双端争用）</h3>
+        <table><thead><tr><th>类型</th><th>源</th><th>说明</th><th>时间</th></tr></thead>
+          <tbody>
+            <tr v-for="d in traces.deviations" :key="'d'+d.id"><td>偏离驳回</td><td>{{d.source}}</td><td>{{d.detail}}（企图{{d.attempted_path}}/卡{{d.card_path}}）</td><td>{{d.at}}</td></tr>
+            <tr v-for="x in traces.contention" :key="'c'+x.id"><td>重裁争用</td><td>{{x.source}}</td><td>{{x.detail}}（{{x.contender_role}}·{{x.action}}）</td><td>{{x.at}}</td></tr>
+            <tr v-for="a in traces.audit" :key="'a'+a.id"><td>{{a.action}}</td><td>{{a.source}}</td><td>{{a.detail}}</td><td>{{a.at}}</td></tr>
+          </tbody></table>
+      </div>
+      <div class="card" v-show="tab===4">
+        <h3>水位页</h3>
+        <p style="color:#64748b;font-size:13px">每源水位随新档与新档版本一起推进；改档后水位必须指向重裁认定的最后一条到达。</p>
+        <table><thead><tr><th>源</th><th>时限档</th><th>档版本</th><th>输出态</th><th>水位到达</th><th>水位时间</th></tr></thead>
+        <tbody><tr v-for="w in watermarks" :key="w.name"><td>{{w.name}}</td><td>{{w.sla_minutes}} 分</td><td>v{{w.tier_version}}</td><td><span class="mode" :class="modeClass(w.output_mode)">{{w.output_mode}}</span></td><td>{{w.watermark_arrival_id||'—'}}</td><td>{{w.watermark_at||'—'}}</td></tr></tbody></table>
+      </div>
+      <div class="card" v-show="tab===5">
+        <h3>历史目录</h3>
+        <p style="color:#64748b;font-size:13px">乙路径先归档为历史快照，复检通过后标已复检；到达主键全程保留，改档不丢主键。</p>
+        <table><thead><tr><th>到达主键</th><th>源</th><th>滞后</th><th>旧级</th><th>新级</th><th>裁决档</th><th>阶段</th><th>快照时间</th></tr></thead>
+          <tbody><tr v-for="x in history" :key="x.id"><td>#{{x.arrival_id}}</td><td>{{x.source}}</td><td>{{x.lag_minutes}} 分</td><td>{{x.old_level}}</td><td>{{x.new_level}}</td><td>{{x.adjudicated_sla}}</td><td>{{x.stage}}</td><td>{{x.snapshot_at}}</td></tr></tbody></table>
       </div>
     </main>
   </div>`
